@@ -1,11 +1,11 @@
 #!/bin/bash
 # Dispatcher Script - Proyecto Redes III
-# Detección infalible por Capa 2 (ARP) para evitar enrutamientos engañosos.
+# Comprobación de red mediante Active Probing (Ping a Internet)
 
 INTERFACE=$1
 ACTION=$2
 
-# Solo actuamos cuando una conexión se levanta
+# Solo actuamos al levantar la interfaz
 if [ "$ACTION" != "up" ]; then
     exit 0
 fi
@@ -16,44 +16,40 @@ if [ "$INTERFACE" != "$TARGET_IF" ]; then
 fi
 
 # -- PROTECCIÓN ANTI-BUCLES --
-# Al cambiar de perfil, NM lanza otro evento "up". Evitamos que el script se ejecute 2 veces.
-LOCKFILE="/tmp/nm_dispatcher_${TARGET_IF}.lock"
+# Al cambiar de perfil manualmente, NM lanza otro evento "up". 
+# Esto evita que el script se lance infinitas veces.
+LOCKFILE="/tmp/nm_dispatcher_${TARGET_IF}_ping.lock"
 if [ -f "$LOCKFILE" ]; then
-    # Si el candado tiene menos de 1 minuto, salimos (estamos en medio de un cambio automático)
     find "$LOCKFILE" -mmin -1 -quit | grep -q . && exit 0
 fi
 touch "$LOCKFILE"
 
-# Redes conocidas
-PROFILES=("casa" "clase-eth" "labo-eth")
-GATEWAYS=("192.168.1.1" "192.168.226.1" "192.168.223.1")
+# --- ORDEN DE PRIORIDAD DE PERFILES ---
+# 1º Universidad (Default) | 2º Casa | 3º Laboratorio
+PROFILES=("clase-eth" "casa" "labo-eth")
 
-# Averiguamos qué perfil ha levantado NM temporalmente
-CURRENT_PROFILE=$(nmcli -t -f GENERAL.CONNECTION device show "$TARGET_IF" | cut -d: -f2)
+logger -t NM-Dispatcher "Iniciando secuencia de comprobación de perfiles SD-WAN..."
 
-for i in "${!PROFILES[@]}"; do
-    perfil="${PROFILES[$i]}"
-    gateway="${GATEWAYS[$i]}"
+for perfil in "${PROFILES[@]}"; do
+    logger -t NM-Dispatcher "Aplicando perfil '$perfil'..."
     
-    logger -t NM-Dispatcher "Buscando MAC del gateway $gateway en la red física (ARP)..."
+    # Forzamos el perfil (esto aplica tu IP estática y el gateway automáticamente)
+    nmcli connection up "$perfil" ifname "$TARGET_IF" > /dev/null 2>&1
     
-    # Lanzamos el dardo ARP (Capa 2). Si la IP no está en este segmento físico, falla de inmediato.
-    if arping -c 2 -w 2 -I "$TARGET_IF" "$gateway" > /dev/null 2>&1; then
-        logger -t NM-Dispatcher "¡Bingo! Gateway $gateway detectado en Capa 2. La red real es '$perfil'."
-        
-        # Si NM se equivocó al conectar (ej. puso "casa" por defecto), lo corregimos.
-        if [ "$CURRENT_PROFILE" != "$perfil" ]; then
-            logger -t NM-Dispatcher "NM aplicó '$CURRENT_PROFILE'. Corrigiendo al perfil correcto: '$perfil'..."
-            nmcli connection up "$perfil" ifname "$TARGET_IF"
-        else
-            logger -t NM-Dispatcher "NM acertó. El perfil activo ($perfil) ya es el correcto."
-        fi
-        
-        # Soltamos el candado y terminamos
+    # IMPORTANTE: Damos 4 segundos para que la tabla de enrutamiento se actualice
+    sleep 4
+    
+    logger -t NM-Dispatcher "Comprobando salida a Internet (Ping a 8.8.8.8)..."
+    
+    # Lanzamos 2 pings a Google con un tiempo máximo de espera de 2 segundos
+    if ping -c 2 -W 2 8.8.8.8 > /dev/null 2>&1; then
+        logger -t NM-Dispatcher "¡ÉXITO! El perfil '$perfil' tiene conexión a Internet. Mantenemos esta configuración."
         rm -f "$LOCKFILE"
         exit 0
+    else
+        logger -t NM-Dispatcher "FALLO: El perfil '$perfil' no llega a Internet. Pasando al siguiente..."
     fi
 done
 
-logger -t NM-Dispatcher "Ningún gateway conocido responde a nivel ARP en esta red."
+logger -t NM-Dispatcher "Ningún perfil logró salir a Internet. Nos quedamos en el último intentado."
 rm -f "$LOCKFILE"
